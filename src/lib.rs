@@ -62,7 +62,6 @@ gfx_defines!{
 struct GraphicsData <R: gfx::Resources>{
     pso: gfx::PipelineState<R, pipe::Meta>,
     pipe_data: pipe::Data<R>,
-    slice: gfx::Slice<R>,
 }
 
 impl <R: gfx::Resources> GraphicsData <R> {
@@ -70,12 +69,9 @@ impl <R: gfx::Resources> GraphicsData <R> {
                              rt: gfx::handle::RawRenderTargetView<R>,
                              primitive: gfx::Primitive)
                              -> GraphicsData<R> {
-        // let pso = factory.create_pipeline_simple(&VERTEX_SHADER, &PIXEL_SHADER, pipe::new())
-        //     .expect("Error creating pipeline state:");
-
         let pso = GraphicsData::<R>::create_pipeline(factory, primitive);
 
-        let (vertex_buffer, slice) = factory.create_vertex_buffer_with_slice(&[], ());
+        let vertex_buffer = factory.create_vertex_buffer(&[]);
         let mvp_buffer = factory.create_constant_buffer(1);
         use gfx::memory::Typed;
         GraphicsData {
@@ -85,7 +81,6 @@ impl <R: gfx::Resources> GraphicsData <R> {
                 out_color: Typed::new(rt),
                 transform: mvp_buffer,
             },
-            slice
         }
     }
 
@@ -98,38 +93,37 @@ impl <R: gfx::Resources> GraphicsData <R> {
             factory.create_pipeline_state(&set, primitive, gfx::state::Rasterizer::new_fill(), pipe::new())
                 .expect("Error creating pipeline state")
         }
-
-    // fn create_pipeline_simple<I: pso::PipelineInit>(&mut self, factory: I, vs: &[u8], ps: &[u8], init: I)
-    //                                                 -> Result<pso::PipelineState<R, I::Meta>,
-    //                                                           PipelineStateError<String>>
-    // {
-    //     let set = try!(self.create_shader_set(vs, ps));
-    //     self.create_pipeline_state(&set, Primitive::TriangleList, state::Rasterizer::new_fill(),
-    //                                init)
-    // }
-
 }
 
+mod batch;
+
+struct TBatch <R: gfx::Resources> {
+    batch: batch::Batch,
+    slice: gfx::Slice<R>,
+    current_lod: u32,
+}
 
 #[allow(dead_code)]
 pub struct Terrain <R: gfx::Resources, F: FactoryExt<R>> {
     terrain_data: Vec<Vec<f32>>,
     grid_distance: f32,
     view_mat: [[f32; 4]; 4],
+    max_lod: u32,
     projection_mat: [[f32; 4]; 4],
     needs_transform_update: bool,
     gfx_data: Option<GraphicsData<R>>,
     needs_tesselation: bool,
     draw_wireframe: bool,
-    factory: F
+    factory: F,
+    batches: Vec<TBatch<R>>
 }
 
 
 #[allow(dead_code)]
 impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
-    pub fn from_data(data: Vec<Vec<f32>>, size: u16,  factory: F) -> Result<Self, String> {
+    pub fn from_data(data: Vec<Vec<f32>>, size: u16, batch_size: u16, factory: F) -> Result<Self, String> {
         if !u16::is_power_of_two(size) {
-            return Result::Err(String::from("size must be power of two"));
+            return Result::Err(String::from("Size must be power of two"));
         }
 
         for (i, v) in data.iter().enumerate() {
@@ -138,24 +132,45 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                     "data[{}] does not match size, {} != {}", i, v.len(), size)))
             }
         }
+
+        if !u16::is_power_of_two(batch_size) {
+            return Result::Err(String::from("Batch size must be power of two"));
+        }
+
+        if batch_size > size {
+            return Result::Err(String::from("Batch size must be lesser or equal to size"));
+        }
+
         if data.len() as u16 != size + 1 {
             Result::Err(String::from(format!("data does not match size, {} != {}", data.len(), size)))
         } else {
+            let batch_size: u16 = 128;
+            let num_batches = size / batch_size as u16;
+            let batches = (0..(num_batches * num_batches))
+                .map(|i| TBatch {
+                    batch: batch::Batch::new(i % num_batches, i / num_batches, size + 1, batch_size),
+                    slice: gfx::Slice::from_vertex_count(0),
+                    current_lod: u32::MAX
+                })
+                .collect();
+
             Ok(Terrain {
                 terrain_data: data,
                 gfx_data: None,
                 view_mat: Default::default(),
+                max_lod: 16 - (batch_size as u16).leading_zeros() - 1,
                 projection_mat: Default::default(),
                 grid_distance: 1.0,
                 needs_transform_update: true,
                 needs_tesselation: true,
-                draw_wireframe: false,
-                factory: factory,
+                draw_wireframe: true,
+                factory,
+                batches
             })
         }
     }
 
-    pub fn from_file(filename: &str, scale: f32, factory: F) -> Result<Self, String> {
+    pub fn from_file(filename: &str, scale: f32, batch_size: u16, factory: F) -> Result<Self, String> {
         let img = match image::open(filename) {
             Ok(i) => i,
             Err(e) => return Err(String::from(format!("Failed to load image: {:}", e)))
@@ -174,7 +189,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
              v.push(row.map(|(_x, _y, p)| {p.to_luma().channels()[0] as f32 * scale}).collect());
         }
 
-        Terrain::from_data(v, (width - 1)  as u16, factory)
+        Terrain::from_data(v, (width - 1)  as u16, batch_size, factory)
     }
 
     pub fn  set_view_matrix(&mut self, view_matrix: &[[f32; 4]; 4]) {
@@ -191,15 +206,20 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         self.needs_tesselation
     }
 
-    pub fn draw<C: gfx::CommandBuffer<R>>(
+    pub fn draw<C: gfx::CommandBuffer<R>, LF: Fn(f32, f32, f32) -> u32>(
         &mut self,
         encoder: &mut gfx::Encoder<R, C>,
         rt: gfx::handle::RawRenderTargetView<R>,
+        lod_fn: LF,
     ) {
         if self.gfx_data.is_none() {
-            self.gfx_data = Some(GraphicsData::new(&mut self.factory, rt, gfx::Primitive::TriangleStrip));
+            let primitive = if self.draw_wireframe {
+                gfx::Primitive::LineStrip
+            } else {
+                gfx::Primitive::TriangleStrip
+            };
+            self.gfx_data = Some(GraphicsData::new(&mut self.factory, rt, primitive));
         }
-        //let gfx_data = self.gfx_data.unwrap_or_else(|| GraphicsData::new(factory, rt));
 
         if self.needs_transform_update {
             let gfx_data = self.gfx_data.as_mut().unwrap();
@@ -210,19 +230,44 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             encoder.update_buffer(&gfx_data.pipe_data.transform, &[mvp_transform], 0)
                 .expect("Failed to update transform:");
         }
-        if self.needs_retesselation() {
-            //let (vertices, indices) = self.update_wireframe();
-            let (vertices, indices) = self.update();
-            let gfx_data = self.gfx_data.as_mut().unwrap();
+        let needs_retesselation = self.needs_retesselation();
+        for tb in &mut self.batches {
+            let b = &tb.batch;
+            let lod = lod_fn((b.x_idx * b.batch_size) as f32 * self.grid_distance,
+                             (b.y_idx * b.batch_size) as f32 * self.grid_distance,
+                             self.grid_distance * b.batch_size as f32,
+            );
+
+            let lod = std::cmp::min(lod, self.max_lod);
+
+            if lod == tb.current_lod && !needs_retesselation {
+                continue;
+            }
+
+            tb.current_lod = lod;
+            let indices = b.update_wireframe(tb.current_lod);
             let index_buffer = self.factory.create_index_buffer(indices.as_slice());
-            let (vertex_buffer, slice) = self.factory.create_vertex_buffer_with_slice(&vertices, index_buffer);
-            gfx_data.pipe_data.vbuf = vertex_buffer;
-            gfx_data.slice = slice;
-            self.needs_tesselation = false;
+            tb.slice = gfx::Slice {
+                start: 0,
+                end: indices.len() as u32,
+                base_vertex: 0,
+                instances: None,
+                buffer: index_buffer
+            }
         }
 
+       if needs_retesselation {
+           let vertices = self.update_vertex_array();
+           let vertex_buffer = self.factory.create_vertex_buffer(&vertices);
+           let gfx_data = self.gfx_data.as_mut().unwrap();
+           gfx_data.pipe_data.vbuf = vertex_buffer;
+           self.needs_tesselation = false;
+       }
+
         let gfx_data = self.gfx_data.as_ref().unwrap();
-        encoder.draw(&gfx_data.slice, &gfx_data.pso, &gfx_data.pipe_data);
+        for b in &self.batches {
+            encoder.draw(&b.slice, &gfx_data.pso, &gfx_data.pipe_data);
+        }
     }
 
     pub fn toggle_wireframe(&mut self) {
@@ -230,12 +275,14 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             self.draw_wireframe = false;
             self.needs_tesselation = true;
             let mut gfx_data = self.gfx_data.as_mut().unwrap();
-            gfx_data.pso = GraphicsData::<R>::create_pipeline(&mut self.factory, gfx::Primitive::TriangleStrip);
+            gfx_data.pso = GraphicsData::<R>::create_pipeline(&mut self.factory,
+                                                              gfx::Primitive::TriangleStrip);
         } else {
             self.draw_wireframe = true;
             self.needs_tesselation = true;
             let mut gfx_data = self.gfx_data.as_mut().unwrap();
-            gfx_data.pso = GraphicsData::<R>::create_pipeline(&mut self.factory, gfx::Primitive::LineStrip);
+            gfx_data.pso = GraphicsData::<R>::create_pipeline(&mut self.factory,
+                                                              gfx::Primitive::LineStrip);
         };
     }
 }
@@ -245,6 +292,7 @@ const BLUE: [f32; 3] = [0.0, 0.0, 1.0];
 
 #[allow(dead_code)]
 impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
+
 
     fn update_vertex_array(&self) -> Vec<Vertex> {
         let a_size = self.terrain_data.len();
@@ -270,7 +318,6 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
 
         let z_step_last  = |row: u32| vec![index_of(d_size - 1, row + 1)].into_iter();
         let z_step_back_last  = |row: u32| vec![index_of(d_size - 1, row)].into_iter();
-        //let z_step_back_first  = |row: u32| vec![index_of(0, row)].into_iter();
 
         let tri_even = |col, row| vec![index_of(col, row), index_of(col + 1, row +1)].into_iter();
         let tri_odd  = |col, row| vec![index_of(col, row), index_of(col, row + 1)].into_iter();
