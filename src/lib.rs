@@ -2,10 +2,13 @@
 extern crate gfx;
 extern crate image;
 extern crate itertools;
+extern crate vecmath;
+
 
 use gfx::traits::FactoryExt;
 use image::GenericImageView;
 use itertools::Itertools;
+use vecmath::{ Vector3, Vector4, Matrix4, vec4_dot, col_mat4_mul, mat4_inv};
 
 const VERTEX_SHADER: &'static [u8] = b"
 #version 150 core
@@ -101,6 +104,28 @@ struct TBatch <R: gfx::Resources> {
     batch: batch::Batch,
     slice: gfx::Slice<R>,
     current_lod: u32,
+    min: f32,
+    max: f32
+}
+
+impl <R: gfx::Resources> TBatch <R> {
+    fn bound(&self) -> Bound {
+        let min = [
+            (self.batch.x_idx * self.batch.batch_size) as f32,
+            self.min,
+            (self.batch.y_idx * self.batch.batch_size) as f32
+        ];
+        let max = [
+            ((self.batch.x_idx + 1) * self.batch.batch_size) as f32,
+            self.max,
+            ((self.batch.y_idx + 1) * self.batch.batch_size) as f32
+        ];
+
+        Bound {
+            min,
+            max
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -108,6 +133,7 @@ pub struct Terrain <R: gfx::Resources, F: FactoryExt<R>> {
     terrain_data: Vec<Vec<f32>>,
     grid_distance: f32,
     view_mat: [[f32; 4]; 4],
+    cull_matrix: Option<Matrix4<f32>>,
     max_lod: u32,
     projection_mat: [[f32; 4]; 4],
     needs_transform_update: bool,
@@ -144,13 +170,22 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         if data.len() as u16 != size + 1 {
             Result::Err(String::from(format!("data does not match size, {} != {}", data.len(), size)))
         } else {
-            let batch_size: u16 = 128;
             let num_batches = size / batch_size as u16;
             let batches = (0..(num_batches * num_batches))
-                .map(|i| TBatch {
-                    batch: batch::Batch::new(i % num_batches, i / num_batches, size + 1, batch_size),
-                    slice: gfx::Slice::from_vertex_count(0),
-                    current_lod: u32::MAX
+                .map(|i| {
+                    let (min, max) = Self::batch_vertical_bounds(
+                        &data,
+                        (i % num_batches) * batch_size,
+                        i / num_batches * batch_size,
+                        batch_size
+                    );
+                    TBatch {
+                        batch: batch::Batch::new(i % num_batches, i / num_batches, size + 1, batch_size),
+                        slice: gfx::Slice::from_vertex_count(0),
+                        current_lod: u32::MAX,
+                        min,
+                        max
+                    }
                 })
                 .collect();
 
@@ -158,6 +193,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                 terrain_data: data,
                 gfx_data: None,
                 view_mat: Default::default(),
+                cull_matrix: None,
                 max_lod: 16 - (batch_size as u16).leading_zeros() - 1,
                 projection_mat: Default::default(),
                 grid_distance: 1.0,
@@ -197,6 +233,10 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         self.needs_transform_update = true;
     }
 
+    pub fn set_cull_view_matrix(&mut self, cull_matrix: Option<Matrix4<f32>>) {
+        self.cull_matrix = cull_matrix;
+    }
+
     pub fn  set_projection_matrix(&mut self, projection_matrix: &[[f32; 4]; 4]) {
         self.projection_mat = projection_matrix.clone();
         self.needs_transform_update = true;
@@ -231,8 +271,18 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                 .expect("Failed to update transform:");
         }
         let needs_retesselation = self.needs_retesselation();
-        for tb in &mut self.batches {
+
+        let cull_view_matrix = self.cull_matrix.unwrap_or(self.view_mat);
+        let pos = mat4_inv(cull_view_matrix)[3];
+        let vp = col_mat4_mul(self.projection_mat, cull_view_matrix);
+        let frustum = Self::extract_planes_from_projmat(vp);
+
+        let draw_batches = self.cull_batches(&frustum, &pos);
+        for (tb, draw) in self.batches.iter_mut().zip(draw_batches.iter()) {
+            if !draw { continue; }
+
             let b = &tb.batch;
+
             let lod = lod_fn((b.x_idx * b.batch_size) as f32 * self.grid_distance,
                              (b.y_idx * b.batch_size) as f32 * self.grid_distance,
                              self.grid_distance * b.batch_size as f32,
@@ -265,7 +315,8 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
        }
 
         let gfx_data = self.gfx_data.as_ref().unwrap();
-        for b in &self.batches {
+        for (b, draw) in self.batches.iter_mut().zip(draw_batches.iter()) {
+            if !draw { continue; }
             encoder.draw(&b.slice, &gfx_data.pso, &gfx_data.pipe_data);
         }
     }
@@ -290,9 +341,98 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
 const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
 const BLUE: [f32; 3] = [0.0, 0.0, 1.0];
 
+type Vector3f = Vector3<f32>;
+type Vector4f = Vector4<f32>;
+type Frustum = [Vector4f; 6];
+
+struct Bound {
+    min: Vector3f,
+    max: Vector3f
+}
+
 #[allow(dead_code)]
 impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
 
+    fn batch_vertical_bounds(data: &Vec<Vec<f32>>,
+                             x_start: u16, y_start: u16,
+                             batch_size: u16) -> (f32, f32) {
+        let mut min = f32::MAX;
+        let mut max = 0.0f32;
+        for y in y_start..(y_start + batch_size + 1) {
+            for x in x_start..(x_start  + batch_size + 1) {
+                min = min.min(data[x as usize][y as usize]);
+                max = max.max(data[x as usize][y as usize]);
+            }
+        }
+        (min, max)
+    }
+
+    fn camera_inside_batch(&self, pos: &Vector4f, batch: &TBatch<R>) -> bool {
+        let bound = batch.bound();
+        pos[0] >= bound.min[0] && pos[0] < bound.max[0]
+            && pos[2] >= bound.min[2] && pos[2] < bound.max[2]
+    }
+
+    fn cull_batches(&self, frustum: &Frustum, position: &Vector4f) -> Vec<bool> {
+        self.batches.iter().map(|b| {
+            self.camera_inside_batch(position, &b)
+                || !Self::box_fully_outside_frustum(&frustum, &b.bound())
+        }).collect()
+    }
+
+    fn extract_planes_from_projmat(mat: Matrix4<f32>) -> Frustum {
+        let left: Vec<f32>   = (0..4).map(|i| { mat[i][3] + mat[i][0] }).collect();
+        let right: Vec<f32>  = (0..4).map(|i| { mat[i][3] - mat[i][0] }).collect();
+        let bottom: Vec<f32> = (0..4).map(|i| { mat[i][3] + mat[i][1] }).collect();
+        let top: Vec<f32>    = (0..4).map(|i| { mat[i][3] - mat[i][1] }).collect();
+        let near: Vec<f32>   = (0..4).map(|i| { mat[i][3] + mat[i][2] }).collect();
+        let far: Vec<f32>    = (0..4).map(|i| { mat[i][3] - mat[i][2] }).collect();
+
+        fn vec_to_array(v: Vec<f32>) -> Vector4f {
+            [v[0], v[1], v[2], v[3]]
+        }
+
+        [
+            vec_to_array(left),
+            vec_to_array(right),
+            vec_to_array(bottom),
+            vec_to_array(top),
+            vec_to_array(near),
+            vec_to_array(far)
+        ]
+
+        // Should work when it's possible to move to 1.48.0
+        // use std::convert::TryInto;
+        // [
+        //     left.try_into().unwrap(),
+        //     right.try_into().unwrap(),
+        //     top.try_into().unwrap(),
+        //     bottom.try_into().unwrap(),
+        //     near.try_into().unwrap(),
+        //     far.try_into().unwrap()
+        // ]
+    }
+
+    fn box_fully_outside_frustum( fru: &Frustum, bound: &Bound) -> bool
+    {
+        let point_inside_frustum = |point: Vector4f| {
+            for i in 0..6 {
+                if vec4_dot( fru[i], point) < 0.0 { return false; }
+            }
+            true
+        };
+
+        if point_inside_frustum([bound.min[0], bound.min[1], bound.min[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.max[0], bound.min[1], bound.min[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.min[0], bound.max[1], bound.min[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.max[0], bound.max[1], bound.min[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.min[0], bound.min[1], bound.max[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.max[0], bound.min[1], bound.max[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.min[0], bound.max[1], bound.max[2], 1.0]) { return false; }
+        if point_inside_frustum([bound.max[0], bound.max[1], bound.max[2], 1.0]) { return false; }
+
+        true
+}
 
     fn update_vertex_array(&self) -> Vec<Vertex> {
         let a_size = self.terrain_data.len();
