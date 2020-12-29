@@ -295,7 +295,11 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             }
 
             tb.current_lod = lod;
-            let indices = b.update(tb.current_lod);
+            let indices = if self.draw_wireframe {
+                b.update_wireframe(tb.current_lod)
+            } else {
+                b.update(tb.current_lod)
+            };
             let index_buffer = self.factory.create_index_buffer(indices.as_slice());
             tb.slice = gfx::Slice {
                 start: 0,

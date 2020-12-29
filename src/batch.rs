@@ -58,6 +58,7 @@ impl Batch {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn update_wireframe(&self, lod: u32) -> Vec<u32> {
         let lod: u32 = 2u32.pow(lod);
         let d_size = self.array_size as u32;
