@@ -17,8 +17,45 @@ impl Batch {
     }
 
     #[allow(dead_code)]
-    pub fn update(&self) -> Vec<u32> {
-        vec![]
+    pub fn update(&self, lod: u32) -> Vec<u32> {
+        let lod: u32 = 2u32.pow(lod);
+        let d_size = self.array_size as u32;
+        let a_size = self.batch_size as u32 / lod;
+
+        let index_of = |x: u32, y: u32| y * d_size + x;
+
+        let z_step_last  = |row: u32| vec![index_of(a_size, row + 1)].into_iter();
+        let z_step_back_last  = |row: u32| vec![index_of(a_size, row)].into_iter();
+
+        let tri_even = |col, row| vec![index_of(col, row), index_of(col + 1, row +1)].into_iter();
+        let tri_odd  = |col, row| vec![index_of(col, row), index_of(col, row + 1)].into_iter();
+
+        let even_row = |row| {
+            std::iter::once(index_of(0, row + 1))
+                .chain((0..a_size).flat_map(move |idx| tri_even(idx, row)))
+                .chain(z_step_back_last(row))
+                .chain(z_step_last(row))
+        };
+
+        let odd_row = |row| {
+            z_step_last(row)
+                .chain((0..a_size).rev().flat_map(move |idx|tri_odd(idx, row)))
+        };
+
+        let select_row =  |idx: u32|{
+            if idx & 1 == 1 {
+                Box::new(odd_row(idx)) as Box<dyn Iterator<Item = u32>>
+            } else {
+                Box::new(even_row(idx)) as Box<dyn Iterator<Item = u32>>
+            }
+        };
+
+        let batch_offset = (self.y_idx as u32 * self.batch_size as u32 * self.array_size as u32)
+            + self.batch_size as u32 * self.x_idx as u32;
+
+        (0..a_size).flat_map(|idx| select_row(idx))
+            .map(|i| i * lod + batch_offset)
+            .collect()
     }
 
     pub fn update_wireframe(&self, lod: u32) -> Vec<u32> {

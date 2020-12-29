@@ -199,7 +199,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                 grid_distance: 1.0,
                 needs_transform_update: true,
                 needs_tesselation: true,
-                draw_wireframe: true,
+                draw_wireframe: false,
                 factory,
                 batches
             })
@@ -295,7 +295,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             }
 
             tb.current_lod = lod;
-            let indices = b.update_wireframe(tb.current_lod);
+            let indices = b.update(tb.current_lod);
             let index_buffer = self.factory.create_index_buffer(indices.as_slice());
             tb.slice = gfx::Slice {
                 start: 0,
@@ -448,79 +448,6 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             }
         }
         v
-    }
-
-    fn update(&self) -> (Vec<Vertex>, Vec<u32>) {
-
-        let d_size = self.terrain_data.len() as u32;
-        let a_size = d_size - 1;
-        let index_of = |x: u32, y: u32| y * d_size + x;
-
-        let z_step_last  = |row: u32| vec![index_of(d_size - 1, row + 1)].into_iter();
-        let z_step_back_last  = |row: u32| vec![index_of(d_size - 1, row)].into_iter();
-
-        let tri_even = |col, row| vec![index_of(col, row), index_of(col + 1, row +1)].into_iter();
-        let tri_odd  = |col, row| vec![index_of(col, row), index_of(col, row + 1)].into_iter();
-
-        let even_row = |row| {
-            std::iter::once(index_of(0, row + 1))
-                .chain((0..a_size).flat_map(move |idx| tri_even(idx, row)))
-                .chain(z_step_back_last(row))
-                .chain(z_step_last(row))
-        };
-
-        let odd_row = |row| {
-            z_step_last(row)
-                .chain((0..a_size).rev().flat_map(move |idx|tri_odd(idx, row)))
-        };
-
-        let select_row =  |idx: u32|{
-            if idx & 1 == 1 {
-                Box::new(odd_row(idx)) as Box<dyn Iterator<Item = u32>>
-            } else {
-                Box::new(even_row(idx)) as Box<dyn Iterator<Item = u32>>
-            }
-        };
-
-
-        let tri_indices: Vec<u32> =
-            (0..d_size).flat_map(|idx| select_row(idx))
-            .collect();
-
-        (self.update_vertex_array(), tri_indices)
-
-    }
-
-    fn update_wireframe(&self) -> (Vec<Vertex>, Vec<u32>) {
-
-        let d_size = self.terrain_data.len() as u32;
-        let a_size = d_size - 1;
-
-        let index_of = |x: u32, y: u32| y * d_size + x;
-
-        let row_line = |row| {(0..(d_size - 1)).map(move |r| index_of(r + 1, row))};
-
-        let z_step_last  = |row: u32| vec![index_of(d_size - 1, row + 1)].into_iter();
-
-        let zig_zag = |col, row| {vec![
-            index_of(col, row),
-            index_of(col, row + 1),
-        ]};
-
-
-        let row = |row| {
-            row_line(row).into_iter()
-                .chain(z_step_last(row))
-                .chain(((0..a_size).rev()).flat_map(move |col| zig_zag(col, row)))
-        };
-
-        let tri_indices: Vec<u32> =
-            (0..=1)
-            .chain((0..d_size).flat_map(move |idx| row(idx)))
-            .chain(row_line(a_size))
-            .collect();
-
-        (self.update_vertex_array(), tri_indices)
     }
 }
 
