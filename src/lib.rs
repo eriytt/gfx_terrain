@@ -8,12 +8,13 @@ extern crate vecmath;
 use gfx::traits::FactoryExt;
 use image::GenericImageView;
 use itertools::Itertools;
-use vecmath::{ Vector3, Vector4, Matrix4, vec4_dot, col_mat4_mul, mat4_inv};
+use vecmath::{ Vector3, Vector4, Matrix4, vec4_dot, col_mat4_mul, mat4_inv, vec3_normalized, vec3_cross, vec3_add, vec3_dot};
 
 const VERTEX_SHADER: &'static [u8] = b"
 #version 150 core
 
 in vec4 a_Pos;
+in vec2 a_Uv;
 in vec3 a_Color;
 
 uniform Transform {
@@ -22,9 +23,11 @@ uniform Transform {
 };
 
 out vec4 v_Color;
+out vec2 v_Uv;
 
 void main() {
     v_Color = vec4(a_Color, 1.0);
+    v_Uv = a_Uv;
     gl_Position = u_Projection * u_View * a_Pos;
 }
 ";
@@ -32,11 +35,15 @@ void main() {
 const PIXEL_SHADER: &'static [u8] =  b"
 #version 150 core
 
+uniform sampler2D t_Shade;
+
 in vec4 v_Color;
+in vec2 v_Uv;
 out vec4 Target0;
 
 void main() {
-    Target0 = v_Color;
+    float lum = texture(t_Shade, v_Uv).r;
+    Target0 = vec4(v_Color.rgb * lum, 1.0);
 }
 ";
 
@@ -46,6 +53,7 @@ type ColorFormat = gfx::format::Srgba8;
 gfx_defines!{
     vertex Vertex {
         pos: [f32; 4] = "a_Pos",
+        uv: [f32; 2] = "a_Uv",
         color: [f32; 3] = "a_Color",
     }
 
@@ -56,6 +64,7 @@ gfx_defines!{
 
     pipeline pipe {
         vbuf: gfx::VertexBuffer<Vertex> = (),
+        shade: gfx::TextureSampler<f32> = "t_Shade",
         transform: gfx::ConstantBuffer<Transform> = "Transform",
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
     }
@@ -67,20 +76,31 @@ struct GraphicsData <R: gfx::Resources>{
     pipe_data: pipe::Data<R>,
 }
 
+use gfx::texture::{SamplerInfo, FilterMethod, WrapMode};
+
 impl <R: gfx::Resources> GraphicsData <R> {
     fn new<F: FactoryExt<R>>(factory: &mut F,
                              rt: gfx::handle::RawRenderTargetView<R>,
-                             primitive: gfx::Primitive)
-                             -> GraphicsData<R> {
+                             primitive: gfx::Primitive,
+                             texture: Vec<u8>,
+                             size: u16
+    ) -> GraphicsData<R> {
         let pso = GraphicsData::<R>::create_pipeline(factory, primitive);
 
         let vertex_buffer = factory.create_vertex_buffer(&[]);
         let mvp_buffer = factory.create_constant_buffer(1);
+
+        let sampler = factory.create_sampler(SamplerInfo::new(FilterMethod::Bilinear, WrapMode::Tile));
+        let (_, view) = factory.create_texture_immutable_u8::<gfx::format::U8Norm>(
+            gfx::texture::Kind::D2(size, size, gfx::texture::AaMode::Single),
+            gfx::texture::Mipmap::Provided,
+            &[texture.as_ref()]).unwrap();
         use gfx::memory::Typed;
         GraphicsData {
             pso,
             pipe_data: pipe::Data {
                 vbuf: vertex_buffer,
+                shade: (view, sampler),
                 out_color: Typed::new(rt),
                 transform: mvp_buffer,
             },
@@ -258,7 +278,14 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             } else {
                 gfx::Primitive::TriangleStrip
             };
-            self.gfx_data = Some(GraphicsData::new(&mut self.factory, rt, primitive));
+            self.gfx_data = Some(GraphicsData::new(
+                &mut self.factory,
+                rt,
+                primitive,
+                Self::calculate_shade_map(&self.terrain_data, self.grid_distance,
+                                          vec3_normalized([0.0f32, -1.0f32, 0.0f32])),
+                (self.terrain_data.len() - 1) as u16
+            ));
         }
 
         if self.needs_transform_update {
@@ -448,10 +475,54 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                                        self.terrain_data[x][y],
                                        y as f32 * self.grid_distance,
                                        1.0],
-                                color: if (x % 2) == 0 || (y % 2) == 0 {WHITE} else {BLUE}});
+                                uv: [x as f32 / (a_size - 1) as f32, y as f32 / (a_size - 1) as f32],
+                                color: if (x % 2) == 0 || (y % 2) == 0 {WHITE} else {BLUE},
+                });
             }
         }
         v
+    }
+
+    fn normal1(data: &Vec<Vec<f32>>, x: usize, y: usize, grid_distance: f32) -> Vector3f {
+        let corner1 = data[x][y];
+        let corner2 = data[x + 1][y + 1];
+        let corner3 = data[x + 1][y];
+        vec3_normalized(vec3_cross(
+            [grid_distance, corner2 - corner1, grid_distance],
+            [grid_distance, corner3 - corner1, 0f32]
+        ))
+    }
+
+    fn normal2(data: &Vec<Vec<f32>>, x: usize, y: usize, grid_distance: f32) -> Vector3f {
+        let corner1 = data[x][y];
+        let corner2 = data[x][y + 1];
+        let corner3 = data[x + 1][y + 1];
+        vec3_normalized(vec3_cross(
+            [0f32, corner2 - corner1, grid_distance],
+            [grid_distance, corner3 - corner1, grid_distance]
+        ))
+    }
+
+    fn normal(data: &Vec<Vec<f32>>, x: usize, y: usize, grid_distance: f32) -> Vector3f {
+        vec3_normalized( vec3_add(
+            Self::normal1(data, x, y, grid_distance),
+            Self::normal2(data, x, y, grid_distance),
+        ))
+    }
+
+    fn calculate_shade_map(data: &Vec<Vec<f32>>, grid_distance: f32, light: Vector3f) -> Vec<u8> {
+        let x_max = data.len() - 1;
+        let y_max = data[0].len() -1;
+        let mut shade_map = Vec::<u8>::with_capacity(x_max * y_max);
+        for y in 0..y_max {
+            for x in 0..x_max {
+                let normal = Self::normal(data, x, y, grid_distance);
+                let lum = -vec3_dot(light, normal);
+                shade_map.push((lum * 255f32) as u8);
+            }
+        }
+
+        shade_map
     }
 }
 
