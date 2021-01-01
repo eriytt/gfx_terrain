@@ -67,6 +67,8 @@ gfx_defines!{
         shade: gfx::TextureSampler<f32> = "t_Shade",
         transform: gfx::ConstantBuffer<Transform> = "Transform",
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
+        out_depth: gfx::DepthTarget<gfx::format::DepthStencil> =
+            gfx::preset::depth::LESS_EQUAL_WRITE,
     }
 }
 
@@ -81,6 +83,7 @@ use gfx::texture::{SamplerInfo, FilterMethod, WrapMode};
 impl <R: gfx::Resources> GraphicsData <R> {
     fn new<F: FactoryExt<R>>(factory: &mut F,
                              rt: gfx::handle::RawRenderTargetView<R>,
+                             ds: gfx::handle::RawDepthStencilView<R>,
                              primitive: gfx::Primitive,
                              texture: Vec<u8>,
                              size: u16
@@ -102,6 +105,7 @@ impl <R: gfx::Resources> GraphicsData <R> {
                 vbuf: vertex_buffer,
                 shade: (view, sampler),
                 out_color: Typed::new(rt),
+                out_depth: Typed::new(ds),
                 transform: mvp_buffer,
             },
         }
@@ -270,6 +274,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         &mut self,
         encoder: &mut gfx::Encoder<R, C>,
         rt: gfx::handle::RawRenderTargetView<R>,
+        ds: gfx::handle::RawDepthStencilView<R>,
         lod_fn: LF,
     ) {
         if self.gfx_data.is_none() {
@@ -280,7 +285,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
             };
             self.gfx_data = Some(GraphicsData::new(
                 &mut self.factory,
-                rt,
+                rt, ds,
                 primitive,
                 Self::calculate_shade_map(&self.terrain_data, self.grid_distance,
                                           vec3_normalized([0.0f32, -1.0f32, 0.0f32])),
