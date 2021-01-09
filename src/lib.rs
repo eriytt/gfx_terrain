@@ -6,7 +6,7 @@ extern crate vecmath;
 
 
 use gfx::traits::FactoryExt;
-use image::GenericImageView;
+use image::{GenericImageView, Pixel};
 use itertools::Itertools;
 use vecmath::{ Vector3, Vector4, Matrix4, vec4_dot, col_mat4_mul, mat4_inv, vec3_normalized, vec3_cross, vec3_add, vec3_dot};
 
@@ -36,6 +36,7 @@ const PIXEL_SHADER: &'static [u8] =  b"
 #version 150 core
 
 uniform sampler2D t_Shade;
+uniform sampler2D t_Tex;
 
 in vec4 v_Color;
 in vec2 v_Uv;
@@ -43,7 +44,8 @@ out vec4 Target0;
 
 void main() {
     float lum = texture(t_Shade, v_Uv).r;
-    Target0 = vec4(v_Color.rgb * lum, 1.0);
+    vec3 color = texture(t_Tex, v_Uv).rgb;
+    Target0 = vec4(color * lum, 1.0);
 }
 ";
 
@@ -65,6 +67,7 @@ gfx_defines!{
     pipeline pipe {
         vbuf: gfx::VertexBuffer<Vertex> = (),
         shade: gfx::TextureSampler<f32> = "t_Shade",
+        tex: gfx::TextureSampler<[f32; 4]> = "t_Tex",
         transform: gfx::ConstantBuffer<Transform> = "Transform",
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<gfx::format::DepthStencil> =
@@ -72,6 +75,21 @@ gfx_defines!{
     }
 }
 
+type TextureType<TF , R> = gfx::handle::ShaderResourceView<R, <TF as gfx::format::Formatted>::View>;
+
+fn create_texture<TexFormat: gfx::format::Formatted, R: gfx::Resources, F: FactoryExt<R>>
+    (data: Vec<u8>, width: u16, height: u16, factory: &mut F)
+     -> TextureType<TexFormat, R> where <TexFormat as gfx::format::Formatted>::Surface: gfx::format::TextureSurface, <TexFormat as gfx::format::Formatted>::Channel: gfx::format::TextureChannel {
+        let (_, view) = factory.create_texture_immutable_u8::<TexFormat>(
+            gfx::texture::Kind::D2(width, height, gfx::texture::AaMode::Single),
+            gfx::texture::Mipmap::Provided,
+            &[data.as_ref()]).unwrap();
+        view
+}
+
+fn create_sampler<R: gfx::Resources, F: FactoryExt<R>>(factory: &mut F) -> gfx::handle::Sampler<R> {
+    factory.create_sampler(SamplerInfo::new(FilterMethod::Bilinear, WrapMode::Tile))
+}
 
 struct GraphicsData <R: gfx::Resources>{
     pso: gfx::PipelineState<R, pipe::Meta>,
@@ -85,25 +103,21 @@ impl <R: gfx::Resources> GraphicsData <R> {
                              rt: gfx::handle::RawRenderTargetView<R>,
                              ds: gfx::handle::RawDepthStencilView<R>,
                              primitive: gfx::Primitive,
-                             texture: Vec<u8>,
-                             size: u16
+                             texdata: &TextureData<R>,
     ) -> GraphicsData<R> {
         let pso = GraphicsData::<R>::create_pipeline(factory, primitive);
 
         let vertex_buffer = factory.create_vertex_buffer(&[]);
         let mvp_buffer = factory.create_constant_buffer(1);
 
-        let sampler = factory.create_sampler(SamplerInfo::new(FilterMethod::Bilinear, WrapMode::Tile));
-        let (_, view) = factory.create_texture_immutable_u8::<gfx::format::U8Norm>(
-            gfx::texture::Kind::D2(size, size, gfx::texture::AaMode::Single),
-            gfx::texture::Mipmap::Provided,
-            &[texture.as_ref()]).unwrap();
+
         use gfx::memory::Typed;
         GraphicsData {
             pso,
             pipe_data: pipe::Data {
                 vbuf: vertex_buffer,
-                shade: (view, sampler),
+                shade: (texdata.shadow_texture.clone(), texdata.shadow_sampler.clone()),
+                tex: (texdata.overall_texture.clone(), texdata.overall_sampler.clone()),
                 out_color: Typed::new(rt),
                 out_depth: Typed::new(ds),
                 transform: mvp_buffer,
@@ -121,6 +135,14 @@ impl <R: gfx::Resources> GraphicsData <R> {
                 .expect("Error creating pipeline state")
         }
 }
+
+struct TextureData <R: gfx::Resources>{
+    overall_texture: TextureType<gfx::format::Rgba8, R>,
+    overall_sampler: gfx::handle::Sampler<R>,
+    shadow_texture: TextureType<gfx::format::U8Norm, R>,
+    shadow_sampler: gfx::handle::Sampler<R>,
+}
+
 
 mod batch;
 
@@ -160,6 +182,7 @@ pub struct Terrain <R: gfx::Resources, F: FactoryExt<R>> {
     cull_matrix: Option<Matrix4<f32>>,
     max_lod: u32,
     projection_mat: [[f32; 4]; 4],
+    texture_data: TextureData<R>,
     needs_transform_update: bool,
     gfx_data: Option<GraphicsData<R>>,
     needs_tesselation: bool,
@@ -171,7 +194,14 @@ pub struct Terrain <R: gfx::Resources, F: FactoryExt<R>> {
 
 #[allow(dead_code)]
 impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
-    pub fn from_data(data: Vec<Vec<f32>>, size: u16, batch_size: u16, factory: F) -> Result<Self, String> {
+    pub fn from_data(data: Vec<Vec<f32>>, size: u16, batch_size: u16,
+                     texture_filename: &str,
+                     mut factory: F) -> Result<Self, String> {
+
+        let grid_distance = 1.0f32;
+        let light_direction = vec3_normalized([0.0f32, -1.0f32, 0.0f32]);
+        let draw_wireframe = false;
+
         if !u16::is_power_of_two(size) {
             return Result::Err(String::from("Size must be power of two"));
         }
@@ -192,45 +222,98 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         }
 
         if data.len() as u16 != size + 1 {
-            Result::Err(String::from(format!("data does not match size, {} != {}", data.len(), size)))
-        } else {
-            let num_batches = size / batch_size as u16;
-            let batches = (0..(num_batches * num_batches))
-                .map(|i| {
-                    let (min, max) = Self::batch_vertical_bounds(
-                        &data,
-                        (i % num_batches) * batch_size,
-                        i / num_batches * batch_size,
-                        batch_size
-                    );
-                    TBatch {
-                        batch: batch::Batch::new(i % num_batches, i / num_batches, size + 1, batch_size),
-                        slice: gfx::Slice::from_vertex_count(0),
-                        current_lod: u32::MAX,
-                        min,
-                        max
-                    }
-                })
-                .collect();
-
-            Ok(Terrain {
-                terrain_data: data,
-                gfx_data: None,
-                view_mat: Default::default(),
-                cull_matrix: None,
-                max_lod: 16 - (batch_size as u16).leading_zeros() - 1,
-                projection_mat: Default::default(),
-                grid_distance: 1.0,
-                needs_transform_update: true,
-                needs_tesselation: true,
-                draw_wireframe: false,
-                factory,
-                batches
-            })
+            return Result::Err(String::from(format!("data does not match size, {} != {}",
+                                                    data.len(), size)));
         }
+
+        let (texture, tw, th) = Self::load_texture(texture_filename)?;
+        if !(tw < u16::MAX as u32 && th < u16::MAX as u32) {
+            return Result::Err(String::from(format!("size of texture > u16, {}x{}", tw, th)));
+        }
+        let overall_texture =
+            create_texture::<gfx::format::Rgba8, R, F>(texture, tw as u16, th as u16, &mut factory);
+        let overall_sampler = create_sampler(&mut factory);
+
+        if !(u32::is_power_of_two(tw) && u32::is_power_of_two(th)){
+            return Result::Err(String::from(
+                format!("Texture size ({}x{})must be power of two", tw, th)));
+        }
+
+        let shadow = Self::calculate_shadow_map(&data, grid_distance, light_direction);
+
+        let shadow_texture =
+            create_texture::<gfx::format::U8Norm, R, F>(shadow, size, size, &mut factory);
+        let shadow_sampler = create_sampler(&mut factory);
+
+        let texture_data = TextureData {
+            overall_texture,
+            overall_sampler,
+            shadow_texture,
+            shadow_sampler,
+        };
+
+
+        let num_batches = size / batch_size as u16;
+        let batches = (0..(num_batches * num_batches))
+            .map(|i| {
+                let (min, max) = Self::batch_vertical_bounds(
+                    &data,
+                    (i % num_batches) * batch_size,
+                    i / num_batches * batch_size,
+                    batch_size
+                );
+                TBatch {
+                    batch: batch::Batch::new(i % num_batches, i / num_batches, size + 1, batch_size),
+                    slice: gfx::Slice::from_vertex_count(0),
+                    current_lod: u32::MAX,
+                    min,
+                    max
+                }
+            })
+            .collect();
+
+        Ok(Terrain {
+            terrain_data: data,
+            gfx_data: None,
+            texture_data,
+            view_mat: Default::default(),
+            cull_matrix: None,
+            max_lod: 16 - (batch_size as u16).leading_zeros() - 1,
+            projection_mat: Default::default(),
+            grid_distance: 1.0,
+            needs_transform_update: true,
+            needs_tesselation: true,
+            draw_wireframe,
+            factory,
+            batches
+        })
     }
 
-    pub fn from_file(filename: &str, scale: f32, batch_size: u16, factory: F) -> Result<Self, String> {
+    fn load_texture(filename: &str) -> Result<(Vec<u8>, u32, u32), String> {
+        let img = match image::open(filename) {
+            Ok(i) => i,
+            Err(e) => return Err(String::from(format!("Failed to load image: {:}", e)))
+        };
+
+        let (width, height) = img.dimensions();
+
+        let mut v = Vec::<u8>::with_capacity((height * width * 4) as usize);
+        for row in img.pixels().chunks(width as usize).into_iter() {
+            for (_x, _y, p) in row {
+                let rgb = p.to_rgb();
+                v.push(rgb[0]);
+                v.push(rgb[1]);
+                v.push(rgb[2]);
+                v.push(255u8);
+            }
+        }
+
+        Ok((v, width, height))
+    }
+
+    pub fn from_file(filename: &str, scale: f32, batch_size: u16,
+                     texture_filename: &str,
+                     factory: F) -> Result<Self, String> {
         let img = match image::open(filename) {
             Ok(i) => i,
             Err(e) => return Err(String::from(format!("Failed to load image: {:}", e)))
@@ -244,12 +327,11 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         }
 
         let mut v = Vec::<Vec<f32>>::with_capacity(width as usize);
-        use image::Pixel;
         for row in img.pixels().chunks(width as usize).into_iter() {
              v.push(row.map(|(_x, _y, p)| {p.to_luma().channels()[0] as f32 * scale}).collect());
         }
 
-        Terrain::from_data(v, (width - 1)  as u16, batch_size, factory)
+        Terrain::from_data(v, (width - 1)  as u16, batch_size, texture_filename, factory)
     }
 
     pub fn  set_view_matrix(&mut self, view_matrix: &[[f32; 4]; 4]) {
@@ -261,9 +343,28 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         self.cull_matrix = cull_matrix;
     }
 
-    pub fn  set_projection_matrix(&mut self, projection_matrix: &[[f32; 4]; 4]) {
+    pub fn set_projection_matrix(&mut self, projection_matrix: &[[f32; 4]; 4]) {
         self.projection_mat = projection_matrix.clone();
         self.needs_transform_update = true;
+    }
+
+    pub fn set_views(&mut self,
+                     rt: gfx::handle::RawRenderTargetView<R>,
+                     ds: gfx::handle::RawDepthStencilView<R>) {
+        let primitive = if self.draw_wireframe {
+            gfx::Primitive::LineStrip
+        } else {
+            gfx::Primitive::TriangleStrip
+        };
+
+        self.gfx_data = Some(
+            GraphicsData::new(
+                &mut self.factory,
+                rt, ds,
+                primitive,
+                &self.texture_data
+            )
+        );
     }
 
     fn needs_retesselation(&self) -> bool {
@@ -273,26 +374,8 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
     pub fn draw<C: gfx::CommandBuffer<R>, LF: Fn(f32, f32, f32) -> u32>(
         &mut self,
         encoder: &mut gfx::Encoder<R, C>,
-        rt: gfx::handle::RawRenderTargetView<R>,
-        ds: gfx::handle::RawDepthStencilView<R>,
         lod_fn: LF,
     ) {
-        if self.gfx_data.is_none() {
-            let primitive = if self.draw_wireframe {
-                gfx::Primitive::LineStrip
-            } else {
-                gfx::Primitive::TriangleStrip
-            };
-            self.gfx_data = Some(GraphicsData::new(
-                &mut self.factory,
-                rt, ds,
-                primitive,
-                Self::calculate_shade_map(&self.terrain_data, self.grid_distance,
-                                          vec3_normalized([0.0f32, -1.0f32, 0.0f32])),
-                (self.terrain_data.len() - 1) as u16
-            ));
-        }
-
         if self.needs_transform_update {
             let gfx_data = self.gfx_data.as_mut().unwrap();
             let mvp_transform = Transform {
@@ -515,7 +598,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         ))
     }
 
-    fn calculate_shade_map(data: &Vec<Vec<f32>>, grid_distance: f32, light: Vector3f) -> Vec<u8> {
+    fn calculate_shadow_map(data: &Vec<Vec<f32>>, grid_distance: f32, light: Vector3f) -> Vec<u8> {
         let x_max = data.len() - 1;
         let y_max = data[0].len() -1;
         let mut shade_map = Vec::<u8>::with_capacity(x_max * y_max);
