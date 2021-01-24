@@ -50,11 +50,25 @@ impl Batch {
             }
         };
 
+        let skirt_vertex_idx = d_size * d_size;
+        let skirt_y_max = || (1..a_size).flat_map(
+            |i| vec![skirt_vertex_idx, index_of(i, a_size), index_of(i + 1, a_size)].into_iter());
+        let skirt_x_max = || (0..a_size).rev().flat_map(
+            |i| vec![skirt_vertex_idx, index_of(a_size, i + 1), index_of(a_size, i)].into_iter());
+        let skirt_y_min = || (0..a_size).rev().flat_map(
+            |i| vec![skirt_vertex_idx, index_of(i + 1, 0), index_of(i, 0)].into_iter());
+        let skirt_x_min = || (0..a_size).flat_map(
+            |i| vec![skirt_vertex_idx, index_of(0, i), index_of(0, i + 1)].into_iter());
+
         let batch_offset = (self.y_idx as u32 * self.batch_size as u32 * self.array_size as u32)
             + self.batch_size as u32 * self.x_idx as u32;
 
         (0..a_size).flat_map(|idx| select_row(idx))
-            .map(|i| i * lod + batch_offset)
+            .chain(skirt_y_max())
+            .chain(skirt_x_max())
+            .chain(skirt_y_min())
+            .chain(skirt_x_min())
+            .map(|i| { if i == skirt_vertex_idx { skirt_vertex_idx } else { i * lod + batch_offset } })
             .collect()
     }
 

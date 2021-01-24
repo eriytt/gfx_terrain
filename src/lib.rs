@@ -318,7 +318,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
 
         let shadow_texture =
             create_texture::<gfx::format::U8Norm, R, F>(shadow, size, size, &mut factory);
-        let shadow_sampler = create_sampler(&mut factory, FilterMethod::Scale);
+        let shadow_sampler = create_sampler(&mut factory, FilterMethod::Mipmap);
 
         let texture_data = TextureData {
             overall_texture,
@@ -650,6 +650,17 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                 });
             }
         }
+
+        // Bottom skirt vertex
+        let mid = (a_size - 1) / 2;
+        v.push(Vertex {
+            pos: [ mid as f32 * self.grid_distance,
+                   -100000.0,
+                   mid as f32 * self.grid_distance,
+                   1.0],
+            uv: [0.0, 0.0],
+            color: WHITE,
+        });
         v
     }
 
