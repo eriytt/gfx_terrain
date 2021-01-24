@@ -37,6 +37,7 @@ const PIXEL_SHADER: &'static [u8] =  b"
 
 uniform sampler2D t_Shade;
 uniform sampler2D t_Tex;
+uniform sampler2D t_Detail;
 
 in vec4 v_Color;
 in vec2 v_Uv;
@@ -44,8 +45,10 @@ out vec4 Target0;
 
 void main() {
     float lum = texture(t_Shade, v_Uv).r;
+    float detail = texture(t_Detail, v_Uv * 100).r;
+    float detail2 = texture(t_Detail, v_Uv * 25).r;
     vec3 color = texture(t_Tex, v_Uv).rgb;
-    Target0 = vec4(color * lum, 1.0);
+    Target0 = vec4(color * lum * detail * detail2, 1.0);
 }
 ";
 
@@ -68,6 +71,7 @@ gfx_defines!{
         vbuf: gfx::VertexBuffer<Vertex> = (),
         shade: gfx::TextureSampler<f32> = "t_Shade",
         tex: gfx::TextureSampler<[f32; 4]> = "t_Tex",
+        detail: gfx::TextureSampler<f32> = "t_Detail",
         transform: gfx::ConstantBuffer<Transform> = "Transform",
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<gfx::format::DepthStencil> =
@@ -77,6 +81,43 @@ gfx_defines!{
 
 type TextureType<TF , R> = gfx::handle::ShaderResourceView<R, <TF as gfx::format::Formatted>::View>;
 
+fn generate_mipmap(data: &Vec<u8>, size: u16) -> Vec<Vec<u8>> {
+    let get_pixel = |x, y| data[(y * size + x) as usize];
+
+    let average_pixel = |x, y| {
+        let pixel_0 = get_pixel(x, y) as u16;
+        let pixel_1 = get_pixel(x + 1, y) as u16;
+        let pixel_2 = get_pixel(x, y + 1) as u16;
+        let pixel_3 = get_pixel(x + 1, y + 1) as u16;
+        ((pixel_0 + pixel_1 + pixel_2 + pixel_3) / 4) as u8
+    };
+
+    if size == 2 {
+        return vec![vec![average_pixel(0, 0)]]
+    }
+
+    let mut mipmap = Vec::with_capacity(size as usize * size as usize / 4);
+    for x in (0..size).step_by(2) {
+        for y in (0..size).step_by(2) {
+            mipmap.push(average_pixel(x, y));
+        }
+    }
+
+    let cons = generate_mipmap(&mipmap, size / 2);
+
+    let mut mm_list = vec![ mipmap];
+    mm_list.extend_from_slice(&cons);
+    mm_list
+}
+
+fn create_mipmap(data: Vec<u8>) -> Vec<Vec<u8>> {
+    let mipmap = generate_mipmap(&data, f64::sqrt(data.len() as f64) as u16);
+    let mut mm = vec![data];
+    mm.extend_from_slice(&mipmap);
+    mm
+}
+
+
 fn create_texture<TexFormat: gfx::format::Formatted, R: gfx::Resources, F: FactoryExt<R>>
     (data: Vec<u8>, width: u16, height: u16, factory: &mut F)
      -> TextureType<TexFormat, R> where <TexFormat as gfx::format::Formatted>::Surface: gfx::format::TextureSurface, <TexFormat as gfx::format::Formatted>::Channel: gfx::format::TextureChannel {
@@ -85,10 +126,22 @@ fn create_texture<TexFormat: gfx::format::Formatted, R: gfx::Resources, F: Facto
             gfx::texture::Mipmap::Provided,
             &[data.as_ref()]).unwrap();
         view
-}
+    }
 
-fn create_sampler<R: gfx::Resources, F: FactoryExt<R>>(factory: &mut F) -> gfx::handle::Sampler<R> {
-    factory.create_sampler(SamplerInfo::new(FilterMethod::Bilinear, WrapMode::Tile))
+fn create_mipmap_texture<TexFormat: gfx::format::Formatted, R: gfx::Resources, F: FactoryExt<R>>
+    (data: Vec<Vec<u8>>, width: u16, height: u16, factory: &mut F)
+     -> TextureType<TexFormat, R> where <TexFormat as gfx::format::Formatted>::Surface: gfx::format::TextureSurface, <TexFormat as gfx::format::Formatted>::Channel: gfx::format::TextureChannel {
+        let adata: Vec<&[u8]> = data.iter().map(|a| a.as_ref()).collect();
+        let (_, view) = factory.create_texture_immutable_u8::<TexFormat>(
+            gfx::texture::Kind::D2(width, height, gfx::texture::AaMode::Single),
+            gfx::texture::Mipmap::Provided,
+            &adata).unwrap();
+        view
+    }
+
+
+fn create_sampler<R: gfx::Resources, F: FactoryExt<R>>(factory: &mut F, filter_method: FilterMethod) -> gfx::handle::Sampler<R> {
+    factory.create_sampler(SamplerInfo::new(filter_method, WrapMode::Tile))
 }
 
 struct GraphicsData <R: gfx::Resources>{
@@ -118,6 +171,7 @@ impl <R: gfx::Resources> GraphicsData <R> {
                 vbuf: vertex_buffer,
                 shade: (texdata.shadow_texture.clone(), texdata.shadow_sampler.clone()),
                 tex: (texdata.overall_texture.clone(), texdata.overall_sampler.clone()),
+                detail: (texdata.detail_texture.clone(), texdata.detail_sampler.clone()),
                 out_color: Typed::new(rt),
                 out_depth: Typed::new(ds),
                 transform: mvp_buffer,
@@ -139,6 +193,8 @@ impl <R: gfx::Resources> GraphicsData <R> {
 struct TextureData <R: gfx::Resources>{
     overall_texture: TextureType<gfx::format::Rgba8, R>,
     overall_sampler: gfx::handle::Sampler<R>,
+    detail_texture: TextureType<gfx::format::U8Norm, R>,
+    detail_sampler: gfx::handle::Sampler<R>,
     shadow_texture: TextureType<gfx::format::U8Norm, R>,
     shadow_sampler: gfx::handle::Sampler<R>,
 }
@@ -191,7 +247,6 @@ pub struct Terrain <R: gfx::Resources, F: FactoryExt<R>> {
     batches: Vec<TBatch<R>>
 }
 
-
 #[allow(dead_code)]
 impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
     pub fn from_data(data: Vec<Vec<f32>>, size: u16, batch_size: u16,
@@ -226,13 +281,33 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
                                                     data.len(), size)));
         }
 
-        let (texture, tw, th) = Self::load_texture(texture_filename)?;
+        let (texture, tw, th) = Self::load_texture(texture_filename, false)?;
         if !(tw < u16::MAX as u32 && th < u16::MAX as u32) {
             return Result::Err(String::from(format!("size of texture > u16, {}x{}", tw, th)));
         }
         let overall_texture =
             create_texture::<gfx::format::Rgba8, R, F>(texture, tw as u16, th as u16, &mut factory);
-        let overall_sampler = create_sampler(&mut factory);
+        let overall_sampler = create_sampler(&mut factory, FilterMethod::Bilinear);
+
+        if !(u32::is_power_of_two(tw) && u32::is_power_of_two(th)){
+            return Result::Err(String::from(
+                format!("Texture size ({}x{})must be power of two", tw, th)));
+        }
+
+        let (texture, tw, th) = Self::load_texture("resources/detail.jpg", true)?;
+        if !(u32::is_power_of_two(tw) && u32::is_power_of_two(th)){
+            return Result::Err(String::from(
+                format!("Texture size ({}x{})must be power of two", tw, th)));
+        }
+
+        if !(tw < u16::MAX as u32 && th < u16::MAX as u32) {
+            return Result::Err(String::from(format!("size of texture > u16, {}x{}", tw, th)));
+        }
+
+        let detail_texture =
+            create_mipmap_texture::<gfx::format::U8Norm, R, F>(
+                create_mipmap(texture), tw as u16, th as u16, &mut factory);
+        let detail_sampler = create_sampler(&mut factory, FilterMethod::Anisotropic(2));
 
         if !(u32::is_power_of_two(tw) && u32::is_power_of_two(th)){
             return Result::Err(String::from(
@@ -243,11 +318,13 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
 
         let shadow_texture =
             create_texture::<gfx::format::U8Norm, R, F>(shadow, size, size, &mut factory);
-        let shadow_sampler = create_sampler(&mut factory);
+        let shadow_sampler = create_sampler(&mut factory, FilterMethod::Scale);
 
         let texture_data = TextureData {
             overall_texture,
             overall_sampler,
+            detail_texture,
+            detail_sampler,
             shadow_texture,
             shadow_sampler,
         };
@@ -289,7 +366,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         })
     }
 
-    fn load_texture(filename: &str) -> Result<(Vec<u8>, u32, u32), String> {
+    fn load_texture(filename: &str, luma: bool) -> Result<(Vec<u8>, u32, u32), String> {
         let img = match image::open(filename) {
             Ok(i) => i,
             Err(e) => return Err(String::from(format!("Failed to load image: {:}", e)))
@@ -300,11 +377,16 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
         let mut v = Vec::<u8>::with_capacity((height * width * 4) as usize);
         for row in img.pixels().chunks(width as usize).into_iter() {
             for (_x, _y, p) in row {
-                let rgb = p.to_rgb();
-                v.push(rgb[0]);
-                v.push(rgb[1]);
-                v.push(rgb[2]);
-                v.push(255u8);
+                if luma {
+                    let l = p.to_luma().channels()[0];
+                    v.push(l);
+                } else {
+                    let rgb = p.to_rgb();
+                    v.push(rgb[0]);
+                    v.push(rgb[1]);
+                    v.push(rgb[2]);
+                    v.push(255u8);
+                }
             }
         }
 
