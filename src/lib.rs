@@ -318,7 +318,7 @@ impl <R: gfx::Resources, F: FactoryExt<R>> Terrain <R, F>{
 
         let shadow_texture =
             create_texture::<gfx::format::U8Norm, R, F>(shadow, size, size, &mut factory);
-        let shadow_sampler = create_sampler(&mut factory, FilterMethod::Mipmap);
+        let shadow_sampler = create_sampler(&mut factory, FilterMethod::Bilinear);
 
         let texture_data = TextureData {
             overall_texture,
